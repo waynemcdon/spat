@@ -1,0 +1,8 @@
+# SPAT CLI Requirements
+# Install with: python -m pip install -r spat_cli/requirements.txt
+
+# Optional: beautiful terminal output (highly recommended)
+rich>=13.0.0
+
+# Optional: GUI banner image and icon support
+Pillow>=10.0.0
