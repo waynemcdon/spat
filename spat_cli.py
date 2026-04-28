@@ -1652,6 +1652,15 @@ def check_virustotal(hostname: str) -> list:
     findings = []
     api_key = os.getenv("VIRUSTOTAL_API_KEY", "")
     if not api_key:
+        # Fallback: read from a .env file next to this script
+        _env_path = Path(__file__).parent / ".env"
+        if _env_path.exists():
+            for _line in _env_path.read_text(encoding="utf-8").splitlines():
+                _line = _line.strip()
+                if _line.startswith("VIRUSTOTAL_API_KEY=") and not _line.startswith("#"):
+                    api_key = _line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+    if not api_key:
         return findings  # silently skip if no key configured
 
     url = f"https://www.virustotal.com/api/v3/domains/{hostname}"

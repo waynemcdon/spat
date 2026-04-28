@@ -18,6 +18,9 @@ env/
 *.json
 *.html
 
+# Environment / secrets
+.env
+
 # VS Code
 .vscode/
 *.code-workspace
