@@ -1589,7 +1589,7 @@ def export_html(hostname: str, findings: list, score: int, outfile: str):
          background: #0d1117; color: #e6edf3; margin: 0; padding: 24px; }}
   h1 {{ color: #e94560; margin: 0 0 4px; }}
   h2 {{ color: #58a6ff; margin: 24px 0 12px; }}
-  .score-block {{ display: flex; align-items: center; gap: 32px; margin: 16px 0 24px; }}
+  .score-block {{ display: flex; align-items: center; gap: 32px; margin: 16px 0 24px; flex-wrap: wrap; }}
   .score {{ font-size: 3.5em; font-weight: 900; color: {sc}; line-height: 1; }}
   .grade {{ font-size: 2.5em; font-weight: 900; color: {sc}; line-height: 1; }}
   .score-label {{ font-size: 0.75em; color: #8b949e; margin-top: 2px; }}
@@ -1599,6 +1599,7 @@ def export_html(hostname: str, findings: list, score: int, outfile: str):
                   letter-spacing: 1px; margin: 0 0 8px; }}
   .badge {{ display:inline-block; margin:3px; padding:3px 10px; border-radius:4px;
             font-size:0.78em; background:#0d1117; border:1px solid #21262d; color:#58a6ff; }}
+  .table-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; }}
   table {{ width: 100%; border-collapse: collapse; margin-top: 8px; }}
   th {{ background: #161b22; color: #8b949e; padding: 10px; text-align: left;
         border-bottom: 1px solid #21262d; font-size: 0.82em; text-transform: uppercase;
@@ -1611,11 +1612,19 @@ def export_html(hostname: str, findings: list, score: int, outfile: str):
   .evidence {{ font-family: monospace; font-size: 0.82em; color: #8b949e;
                word-break: break-all; }}
   .fail-summary {{ margin-bottom: 20px; }}
+  @media (max-width: 640px) {{
+    body {{ padding: 14px; }}
+    .logo-img {{ width: 100px !important; height: 100px !important; }}
+    .logo-header {{ justify-content: center; text-align: center; }}
+    .score-block {{ gap: 20px; }}
+    .score {{ font-size: 2.4em; }}
+    .grade {{ font-size: 1.8em; }}
+  }}
 </style>
 </head>
 <body>
-<div style="display:flex;align-items:center;gap:18px;margin-bottom:4px">
-  <img src="{logo_uri}" alt="SPAT Shield" style="width:220px;height:220px;object-fit:contain">
+<div class="logo-header" style="display:flex;align-items:center;gap:18px;margin-bottom:4px;flex-wrap:wrap">
+  <img class="logo-img" src="{logo_uri}" alt="SPAT Shield" style="width:220px;height:220px;object-fit:contain;flex-shrink:0;max-width:100%">
   <div>
     <div class="logo">SPAT CLI</div>
     <div class="meta" style="margin:0">Security Posture Analysis Tool &mdash; Antibody Cyber Technology, LLC</div>
@@ -1646,6 +1655,7 @@ def export_html(hostname: str, findings: list, score: int, outfile: str):
 </div>
 
 <h2>Findings</h2>
+<div class="table-wrap">
 <table>
   <thead>
     <tr>
@@ -1659,6 +1669,7 @@ def export_html(hostname: str, findings: list, score: int, outfile: str):
   </thead>
   <tbody>{rows}</tbody>
 </table>
+</div>
 <p class="meta" style="margin-top:30px">&copy; 2026 Antibody Cyber Technology, LLC &mdash; https://antibodycyber.com</p>
 </body>
 </html>"""
