@@ -1645,6 +1645,118 @@ def export_html(hostname: str, findings: list, score: int, outfile: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# VIRUSTOTAL REPUTATION CHECK
+# ═══════════════════════════════════════════════════════════════════════════
+
+def check_virustotal(hostname: str) -> list:
+    findings = []
+    api_key = os.getenv("VIRUSTOTAL_API_KEY", "")
+    if not api_key:
+        return findings  # silently skip if no key configured
+
+    url = f"https://www.virustotal.com/api/v3/domains/{hostname}"
+    headers = {"x-apikey": api_key}
+
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        findings.append({
+            "name": "VirusTotal Reputation", "category": "Threat Intelligence",
+            "severity": "INFO",
+            "description": "VirusTotal lookup could not be completed.",
+            "evidence": str(e), "remediation": "",
+            "status": "info", "score_impact": 0
+        })
+        return findings
+
+    attrs    = data.get("data", {}).get("attributes", {})
+    stats    = attrs.get("last_analysis_stats", {})
+    malicious   = int(stats.get("malicious", 0))
+    suspicious  = int(stats.get("suspicious", 0))
+    harmless    = int(stats.get("harmless", 0))
+    undetected  = int(stats.get("undetected", 0))
+    total       = malicious + suspicious + harmless + undetected
+    categories  = attrs.get("categories", {})
+    reputation  = attrs.get("reputation", 0)
+    tags        = attrs.get("tags", [])
+
+    cat_summary = ", ".join(set(categories.values()))[:200] if categories else "N/A"
+    tag_summary = ", ".join(tags[:10]) if tags else ""
+
+    # ── Malicious detections ──────────────────────────────────────────────
+    if malicious >= 5:
+        findings.append({
+            "name": f"VirusTotal: Malicious ({malicious}/{total} vendors)",
+            "category": "Threat Intelligence",
+            "severity": "CRITICAL",
+            "description": f"{malicious} of {total} security vendors flagged this domain as malicious.",
+            "evidence": f"Malicious: {malicious} | Suspicious: {suspicious} | Harmless: {harmless} | Categories: {cat_summary}",
+            "remediation": "Investigate immediately. Domain may be hosting malware, phishing, or C2 infrastructure.",
+            "status": "fail", "score_impact": 25
+        })
+    elif malicious >= 1:
+        findings.append({
+            "name": f"VirusTotal: Suspicious ({malicious} vendor flag)",
+            "category": "Threat Intelligence",
+            "severity": "HIGH",
+            "description": f"{malicious} security vendor(s) flagged this domain. May be a false positive — review recommended.",
+            "evidence": f"Malicious: {malicious} | Suspicious: {suspicious} | Harmless: {harmless} | Categories: {cat_summary}",
+            "remediation": "Review the VirusTotal report at https://www.virustotal.com/gui/domain/" + hostname,
+            "status": "warn", "score_impact": 10
+        })
+    elif suspicious >= 3:
+        findings.append({
+            "name": f"VirusTotal: Potentially Suspicious ({suspicious} vendors)",
+            "category": "Threat Intelligence",
+            "severity": "MEDIUM",
+            "description": f"{suspicious} vendor(s) marked the domain as suspicious.",
+            "evidence": f"Malicious: {malicious} | Suspicious: {suspicious} | Harmless: {harmless} | Categories: {cat_summary}",
+            "remediation": "Review the VirusTotal report.",
+            "status": "warn", "score_impact": 5
+        })
+    else:
+        findings.append({
+            "name": "VirusTotal: Clean",
+            "category": "Threat Intelligence",
+            "severity": "INFO",
+            "description": f"No malicious detections. {harmless} vendors marked clean, {malicious} malicious, {suspicious} suspicious.",
+            "evidence": f"Reputation score: {reputation} | Categories: {cat_summary}" + (f" | Tags: {tag_summary}" if tag_summary else ""),
+            "remediation": "", "status": "pass", "score_impact": 0
+        })
+
+    # ── Negative reputation warning ───────────────────────────────────────
+    if reputation < -10:
+        findings.append({
+            "name": f"VirusTotal: Negative Reputation Score ({reputation})",
+            "category": "Threat Intelligence",
+            "severity": "HIGH",
+            "description": f"Community reputation score is {reputation} (negative = distrust). Often indicates historical abuse.",
+            "evidence": f"VT reputation: {reputation}",
+            "remediation": "Investigate domain history on VirusTotal.",
+            "status": "warn", "score_impact": 5
+        })
+
+    # ── Phishing / malware category tag ──────────────────────────────────
+    bad_cats = [c.lower() for c in categories.values()
+                if any(w in c.lower() for w in ("phish", "malware", "spam", "scam", "fraud", "exploit"))]
+    if bad_cats:
+        findings.append({
+            "name": f"VirusTotal: Threat Category — {', '.join(bad_cats[:3])}",
+            "category": "Threat Intelligence",
+            "severity": "HIGH",
+            "description": "One or more vendors categorised this domain under a threat category.",
+            "evidence": ", ".join(bad_cats),
+            "remediation": "Review domain classification and remediate if owned.",
+            "status": "fail", "score_impact": 10
+        })
+
+    return findings
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MAIN SCAN RUNNER
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1668,6 +1780,7 @@ def run_scan(hostname: str, ssh_port: int = 22, skip_ssh: bool = False,
             ("DNSSEC",             lambda: check_dnssec(hostname)),
             ("Port Scan",          lambda: check_ports(hostname)),
             ("robots.txt",         lambda: check_robots(hostname)),
+            ("VirusTotal",         lambda: check_virustotal(hostname)),
         ]
     if not skip_ssh:
         checks += [
