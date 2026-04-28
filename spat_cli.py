@@ -1614,8 +1614,8 @@ def export_html(hostname: str, findings: list, score: int, outfile: str):
 </style>
 </head>
 <body>
-<div style="display:flex;align-items:center;gap:14px;margin-bottom:4px">
-  <img src="{logo_uri}" alt="SPAT Shield" style="width:52px;height:52px;object-fit:contain">
+<div style="display:flex;align-items:center;gap:18px;margin-bottom:4px">
+  <img src="{logo_uri}" alt="SPAT Shield" style="width:90px;height:90px;object-fit:contain">
   <div>
     <div class="logo">SPAT CLI</div>
     <div class="meta" style="margin:0">Security Posture Analysis Tool &mdash; Antibody Cyber Technology, LLC</div>
