@@ -1499,6 +1499,22 @@ def export_json(hostname: str, findings: list, score: int, outfile: str):
     print(f"\n  {GREEN}✔{RESET} JSON report saved: {outfile}")
 
 
+def _logo_data_uri() -> str:
+    """Return a base64 data URI for ant_shield2.png, falling back to hosted URL."""
+    import base64 as _b64
+    candidates = [
+        Path(__file__).parent / "ant_shield2.png",
+        Path(__file__).parent.parent / "ant_shield2.png",
+    ]
+    for p in candidates:
+        try:
+            data = p.read_bytes()
+            return "data:image/png;base64," + _b64.b64encode(data).decode()
+        except OSError:
+            pass
+    return "https://spat.urlcybersecurity.com/static/img/ant_shield2.png"
+
+
 def export_html(hostname: str, findings: list, score: int, outfile: str):
     status_color = {"pass": "#2ea043", "warn": "#d29922", "fail": "#f85149", "info": "#58a6ff"}
 
@@ -1560,6 +1576,7 @@ def export_html(hostname: str, findings: list, score: int, outfile: str):
         cat_badges = '<span style="color:#2ea043">No failures detected across all categories.</span>'
 
     checks_run = list({f.get("category", "") for f in findings})
+    logo_uri = _logo_data_uri()
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1597,8 +1614,13 @@ def export_html(hostname: str, findings: list, score: int, outfile: str):
 </style>
 </head>
 <body>
-<div class="logo">SPAT CLI</div>
-<div class="meta">Security Posture Analysis Tool &mdash; Antibody Cyber Technology, LLC</div>
+<div style="display:flex;align-items:center;gap:14px;margin-bottom:4px">
+  <img src="{logo_uri}" alt="SPAT Shield" style="width:52px;height:52px;object-fit:contain">
+  <div>
+    <div class="logo">SPAT CLI</div>
+    <div class="meta" style="margin:0">Security Posture Analysis Tool &mdash; Antibody Cyber Technology, LLC</div>
+  </div>
+</div>
 <h1>Scan Report: {hostname}</h1>
 <p class="meta">Scanned: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
 
