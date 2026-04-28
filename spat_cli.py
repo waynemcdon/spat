@@ -1766,6 +1766,111 @@ def check_virustotal(hostname: str) -> list:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# URLHAUS MALWARE DISTRIBUTION CHECK
+# ═══════════════════════════════════════════════════════════════════════════
+
+def check_urlhaus(hostname: str) -> list:
+    """Check URLhaus (abuse.ch) for active malware URLs hosted on this domain."""
+    import urllib.request as _ureq
+    import urllib.parse as _uparse
+
+    url = "https://urlhaus-api.abuse.ch/v1/host/"
+    data = _uparse.urlencode({"host": hostname}).encode("utf-8")
+    req = _ureq.Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+
+    try:
+        with _ureq.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return [{
+            "name": "URLhaus Lookup Failed",
+            "category": "Threat Intelligence",
+            "severity": "INFO",
+            "description": "URLhaus malware check could not be completed.",
+            "evidence": str(e),
+            "remediation": "",
+            "status": "info",
+            "score_impact": 0,
+        }]
+
+    query_status = result.get("query_status", "")
+
+    # No results — domain not in URLhaus database
+    if query_status in ("no_results", "is_host"):
+        urls_found = result.get("urls", [])
+        if not urls_found:
+            return [{
+                "name": "URLhaus: Clean",
+                "category": "Threat Intelligence",
+                "severity": "INFO",
+                "description": "Domain not found in URLhaus malware database.",
+                "evidence": "No active malware URLs detected.",
+                "remediation": "",
+                "status": "pass",
+                "score_impact": 0,
+            }]
+
+    urls_list = result.get("urls", [])
+    online   = [u for u in urls_list if u.get("url_status") == "online"]
+    offline  = [u for u in urls_list if u.get("url_status") != "online"]
+
+    findings = []
+
+    if online:
+        malware_tags = list({t for u in online for t in (u.get("tags") or [])})[:5]
+        tag_str = ", ".join(malware_tags) if malware_tags else "unknown"
+        sample_urls = "; ".join(u.get("url", "") for u in online[:3])
+        findings.append({
+            "name": f"URLhaus: Active Malware URLs ({len(online)} live)",
+            "category": "Threat Intelligence",
+            "severity": "CRITICAL",
+            "description": (
+                f"{len(online)} live malware URL(s) are currently being served from this domain "
+                f"according to URLhaus (abuse.ch)."
+            ),
+            "evidence": f"Live URLs: {len(online)} | Tags: {tag_str} | Examples: {sample_urls}",
+            "remediation": (
+                "Investigate and take down malware content immediately. "
+                f"Review full report: https://urlhaus.abuse.ch/host/{hostname}/"
+            ),
+            "status": "fail",
+            "score_impact": 25,
+        })
+    elif offline:
+        malware_tags = list({t for u in offline for t in (u.get("tags") or [])})[:5]
+        tag_str = ", ".join(malware_tags) if malware_tags else "unknown"
+        findings.append({
+            "name": f"URLhaus: Historical Malware URLs ({len(offline)} inactive)",
+            "category": "Threat Intelligence",
+            "severity": "MEDIUM",
+            "description": (
+                f"{len(offline)} malware URL(s) associated with this domain are now offline, "
+                f"but were previously reported to URLhaus (abuse.ch)."
+            ),
+            "evidence": f"Offline/removed URLs: {len(offline)} | Tags: {tag_str}",
+            "remediation": (
+                f"Review history: https://urlhaus.abuse.ch/host/{hostname}/ — "
+                "ensure all malicious content has been removed."
+            ),
+            "status": "warn",
+            "score_impact": 5,
+        })
+    else:
+        findings.append({
+            "name": "URLhaus: Clean",
+            "category": "Threat Intelligence",
+            "severity": "INFO",
+            "description": "Domain not found in URLhaus malware database.",
+            "evidence": "No active malware URLs detected.",
+            "remediation": "",
+            "status": "pass",
+            "score_impact": 0,
+        })
+
+    return findings
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MAIN SCAN RUNNER
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1790,6 +1895,7 @@ def run_scan(hostname: str, ssh_port: int = 22, skip_ssh: bool = False,
             ("Port Scan",          lambda: check_ports(hostname)),
             ("robots.txt",         lambda: check_robots(hostname)),
             ("VirusTotal",         lambda: check_virustotal(hostname)),
+            ("URLhaus",            lambda: check_urlhaus(hostname)),
         ]
     if not skip_ssh:
         checks += [
