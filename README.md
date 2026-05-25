@@ -1,7 +1,7 @@
 # SPAT CLI — Security Posture Analysis Tool
 
 Command-line security scanner by **Antibody Cyber Technology, LLC**  
-Mirrors the SPAT web tool at https://spat.urlcybersecurity.com
+Mirrors the SPAT web tool at https://spatcyber.com
 
 ---
 
