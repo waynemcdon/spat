@@ -13,11 +13,11 @@ import os
 import re
 import socket
 import ssl
+import html
 import struct
 import subprocess
 import sys
 import time
-import threading
 
 # ── Force UTF-8 output on Windows (avoids cp1252 UnicodeEncodeError) ───────
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -53,6 +53,48 @@ BOLD   = "\033[1m"
 RESET  = "\033[0m"
 
 VERSION = "1.0.0"
+
+# ── SSL context backed by certifi CA bundle (fixes PyInstaller/Windows SSL) ──
+def _ssl_context() -> ssl.SSLContext:
+    """Return an SSLContext that verifies against the certifi CA bundle when
+    available, falling back to the system default store."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+def _read_env_key(var_name: str) -> str:
+    """Read an API key from environment variable or a .env file.
+
+    Search order:
+      1. Environment variable (always works, any context).
+      2. .env next to the running executable (PyInstaller frozen build).
+      3. .env next to this source file (running from source).
+    """
+    value = os.getenv(var_name, "")
+    if value:
+        return value
+
+    candidates = []
+    # When frozen by PyInstaller, sys.executable is the .exe itself
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).parent / ".env")
+    # Running from source
+    candidates.append(Path(__file__).parent / ".env")
+    # cwd — spat_gui.exe launches us with cwd=HERE (the exe's folder),
+    # so a .env placed next to the exe is always found this way.
+    candidates.append(Path(os.getcwd()) / ".env")
+
+    for env_path in candidates:
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith(f"{var_name}=") and not line.startswith("#"):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+
+    return ""
 
 BANNER = rf"""
 {CYAN}{BOLD}
@@ -162,7 +204,7 @@ def check_dns(hostname: str) -> list:
 
 def check_tls(hostname: str) -> list:
     findings = []
-    ctx = ssl.create_default_context()
+    ctx = _ssl_context()
     try:
         with socket.create_connection((hostname, 443), timeout=10) as sock:
             with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
@@ -170,10 +212,13 @@ def check_tls(hostname: str) -> list:
                 proto = ssock.version()
                 cipher = ssock.cipher()
 
-        not_after = datetime.strptime(
-            cert["notAfter"].rsplit(" ", 1)[0], "%b %d %H:%M:%S %Y"
-        ).replace(tzinfo=timezone.utc)
-        days_left = (not_after - datetime.now(timezone.utc)).days
+        try:
+            not_after = datetime.strptime(
+                cert["notAfter"].rsplit(" ", 1)[0], "%b %d %H:%M:%S %Y"
+            ).replace(tzinfo=timezone.utc)
+            days_left = (not_after - datetime.now(timezone.utc)).days
+        except ValueError:
+            days_left = None
 
         subject = dict(x[0] for x in cert.get("subject", ()))
         issuer  = dict(x[0] for x in cert.get("issuer", ()))
@@ -181,7 +226,16 @@ def check_tls(hostname: str) -> list:
         issuer_name = issuer.get("organizationName", "unknown")
 
         # Expiry
-        if days_left < 0:
+        if days_left is None:
+            findings.append({
+                "name": "TLS Certificate Expiry Unknown", "category": "TLS/SSL",
+                "severity": "INFO",
+                "description": f"Could not parse certificate expiry date. CN={cn}, Issuer={issuer_name}",
+                "evidence": cert.get("notAfter", ""),
+                "remediation": "Verify the certificate validity manually.",
+                "status": "info", "score_impact": 0
+            })
+        elif days_left < 0:
             findings.append({
                 "name": "TLS Certificate Expired", "category": "TLS/SSL",
                 "severity": "HIGH",
@@ -233,12 +287,12 @@ def check_tls_protocols(hostname: str) -> list:
     weak = []
     strong = []
     proto_map = {
-        "TLSv1":   (ssl.PROTOCOL_TLS_CLIENT, {"minimum_version": ssl.TLSVersion.TLSv1},   True),
-        "TLSv1.1": (ssl.PROTOCOL_TLS_CLIENT, {"minimum_version": ssl.TLSVersion.TLSv1_1}, True),
-        "TLSv1.2": (ssl.PROTOCOL_TLS_CLIENT, {"minimum_version": ssl.TLSVersion.TLSv1_2}, False),
-        "TLSv1.3": (ssl.PROTOCOL_TLS_CLIENT, {"minimum_version": ssl.TLSVersion.TLSv1_3}, False),
+        "TLSv1":   ({"minimum_version": ssl.TLSVersion.TLSv1},   True),
+        "TLSv1.1": ({"minimum_version": ssl.TLSVersion.TLSv1_1}, True),
+        "TLSv1.2": ({"minimum_version": ssl.TLSVersion.TLSv1_2}, False),
+        "TLSv1.3": ({"minimum_version": ssl.TLSVersion.TLSv1_3}, False),
     }
-    for proto_name, (_, opts, is_weak) in proto_map.items():
+    for proto_name, (opts, is_weak) in proto_map.items():
         try:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
@@ -285,7 +339,7 @@ def check_tls_protocols(hostname: str) -> list:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _http_get(url: str, max_redirs: int = 3) -> tuple:
-    """Returns (status_code, headers_dict, body) via curl."""
+    """Returns (status_code, headers_dict) via curl."""
     try:
         result = subprocess.run(
             ["curl", "-sk", "-D", "-", "--max-time", "10",
@@ -306,14 +360,14 @@ def _http_get(url: str, max_redirs: int = 3) -> tuple:
             elif ":" in line:
                 k, _, v = line.partition(":")
                 headers[k.strip().lower()] = v.strip()
-        return status_code, headers, ""
+        return status_code, headers
     except Exception:
-        return 0, {}, ""
+        return 0, {}
 
 
 def check_http_headers(hostname: str) -> list:
     findings = []
-    _, headers, _ = _http_get(f"https://{hostname}/")
+    _, headers = _http_get(f"https://{hostname}/")
     if not headers:
         return findings
 
@@ -357,12 +411,14 @@ def check_http_headers(hostname: str) -> list:
         "server": headers.get("server", ""),
         "x-powered-by": headers.get("x-powered-by", "")
     }
-    disclosed = [f"{k}: {v}" for k, v in info_headers.items() if v]
+    _ver_re = re.compile(r'/\d+[\d.]*')
+    disclosed = [f"{k}: {v}" for k, v in info_headers.items()
+                 if v and _ver_re.search(v)]
     if disclosed:
         findings.append({
             "name": "Server Version Disclosure", "category": "HTTP Security",
             "severity": "LOW",
-            "description": "Server is leaking version information.",
+            "description": "Server header exposes version information.",
             "evidence": "; ".join(disclosed),
             "remediation": "Remove or genericize Server and X-Powered-By headers.",
             "status": "warn", "score_impact": 3
@@ -372,7 +428,7 @@ def check_http_headers(hostname: str) -> list:
 
 def check_http_redirect(hostname: str) -> list:
     findings = []
-    status, headers, _ = _http_get(f"http://{hostname}/", max_redirs=0)
+    status, headers = _http_get(f"http://{hostname}/", max_redirs=0)
     if status in (301, 302, 307, 308):
         loc = headers.get("location", "")
         if loc.startswith("https://"):
@@ -384,14 +440,34 @@ def check_http_redirect(hostname: str) -> list:
                 "remediation": "", "status": "pass", "score_impact": 0
             })
         else:
-            findings.append({
-                "name": "HTTP Redirect Not HTTPS", "category": "HTTP Security",
-                "severity": "MEDIUM",
-                "description": f"HTTP redirects but not to HTTPS: {loc[:60]}",
-                "evidence": f"Status={status}, Location={loc[:60]}",
-                "remediation": "Ensure HTTP redirects to HTTPS only.",
-                "status": "warn", "score_impact": 5
-            })
+            # First hop goes to HTTP — follow the full chain to see if it ultimately reaches HTTPS
+            try:
+                result = subprocess.run(
+                    ["curl", "-sk", "-L", "-o", os.devnull, "--max-redirs", "10",
+                     "--write-out", "%{url_effective}", "--max-time", "10",
+                     f"http://{hostname}/"],
+                    capture_output=True, text=True, timeout=15
+                )
+                final_url = result.stdout.strip()
+            except Exception:
+                final_url = ""
+            if final_url.startswith("https://"):
+                findings.append({
+                    "name": "HTTP\u2192HTTPS Redirect", "category": "HTTP Security",
+                    "severity": "INFO",
+                    "description": f"HTTP redirects to HTTPS via multi-hop chain (first hop: {loc[:60]}).",
+                    "evidence": f"Final URL: {final_url[:80]}",
+                    "remediation": "", "status": "pass", "score_impact": 0
+                })
+            else:
+                findings.append({
+                    "name": "HTTP Redirect Not HTTPS", "category": "HTTP Security",
+                    "severity": "MEDIUM",
+                    "description": "HTTP redirect chain does not end at HTTPS.",
+                    "evidence": f"First hop: {loc[:60]} | Final URL: {(final_url or 'unknown')[:60]}",
+                    "remediation": "Ensure HTTP redirects to HTTPS only.",
+                    "status": "warn", "score_impact": 5
+                })
     elif status == 200:
         findings.append({
             "name": "No HTTP→HTTPS Redirect", "category": "HTTP Security",
@@ -496,7 +572,7 @@ def check_robots(hostname: str) -> list:
     findings = []
     try:
         result = subprocess.run(
-            ["curl", "-sk", "--max-time", "8", f"https://{hostname}/robots.txt"],
+            ["curl", "-skL", "--max-time", "8", f"https://{hostname}/robots.txt"],
             capture_output=True, text=True, timeout=12
         )
         body = result.stdout
@@ -835,12 +911,15 @@ def check_ssh_auth(hostname: str, port: int = 22) -> list:
 # EMAIL SECURITY  (SPF · DMARC · DKIM · MX)
 # ═══════════════════════════════════════════════════════════════════════════
 
+_DNS_SERVER = "8.8.8.8"  # Explicit resolver — bypasses local OS/router DNS cache
+
+
 def _dns_txt_records(hostname: str) -> list:
-    """Return TXT records for hostname using nslookup (cross-platform)."""
+    """Return TXT records for hostname. Uses 8.8.8.8 to bypass local DNS cache."""
     records = []
     try:
         result = subprocess.run(
-            ["nslookup", "-type=TXT", hostname],
+            ["nslookup", "-type=TXT", hostname, _DNS_SERVER],
             capture_output=True, text=True, timeout=10, errors="replace"
         )
         for line in result.stdout.split("\n"):
@@ -848,12 +927,19 @@ def _dns_txt_records(hostname: str) -> list:
                 parts = re.findall(r'"([^"]*)"', line)
                 if parts:
                     records.append(" ".join(parts))
+        # Second pass: catch records that appear without enclosing quotes
+        # (some Windows nslookup versions omit quotes for long or inline TXT values)
+        for line in result.stdout.split("\n"):
+            ls = line.strip().lstrip('"').rstrip('"\r')
+            if any(ls.lower().startswith(p) for p in ("v=spf1", "v=dmarc1", "v=dkim1")):
+                if ls not in records:
+                    records.append(ls)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     if not records:
         try:
             result = subprocess.run(
-                ["dig", "+short", hostname, "TXT"],
+                ["dig", f"@{_DNS_SERVER}", "+short", hostname, "TXT"],
                 capture_output=True, text=True, timeout=10, errors="replace"
             )
             for line in result.stdout.strip().split("\n"):
@@ -865,11 +951,11 @@ def _dns_txt_records(hostname: str) -> list:
 
 
 def _dns_mx_records(hostname: str) -> list:
-    """Return MX records for hostname."""
+    """Return MX records for hostname. Uses 8.8.8.8 to bypass local DNS cache."""
     records = []
     try:
         result = subprocess.run(
-            ["nslookup", "-type=MX", hostname],
+            ["nslookup", "-type=MX", hostname, _DNS_SERVER],
             capture_output=True, text=True, timeout=10, errors="replace"
         )
         for line in result.stdout.split("\n"):
@@ -887,7 +973,18 @@ def check_email_security(hostname: str) -> list:
 
     # ── MX records ─────────────────────────────────────────────────────────
     mx = _dns_mx_records(hostname)
-    if mx:
+    # Null MX: single record with empty/root exchange (RFC 7505).
+    # nslookup returns the full line, e.g. "host  MX preference = 0, mail exchanger = (root)"
+    # so we must extract just the exchange value rather than comparing the whole line.
+    if not mx:
+        null_mx = True
+    elif len(mx) == 1:
+        _mx_m = re.search(r'mail\s+exchang(?:er|e)\s*=\s*(\S+)', mx[0], re.IGNORECASE)
+        _exchange = _mx_m.group(1).rstrip('.') if _mx_m else mx[0].strip().rstrip('.')
+        null_mx = _exchange in ('', '.', '(root)', 'root')
+    else:
+        null_mx = False
+    if mx and not null_mx:
         findings.append({
             "name": "MX Records Present", "category": "Email Security",
             "severity": "INFO",
@@ -897,17 +994,23 @@ def check_email_security(hostname: str) -> list:
         })
     else:
         findings.append({
-            "name": "No MX Records", "category": "Email Security",
-            "severity": "LOW",
-            "description": f"No MX records found for {hostname}.",
-            "evidence": "nslookup -type=MX returned empty",
-            "remediation": "If this domain sends email, add MX records.",
+            "name": "No MX Records (Null MX)", "category": "Email Security",
+            "severity": "INFO",
+            "description": f"No mail exchanger configured for {hostname} — domain does not accept email.",
+            "evidence": "; ".join(mx) if mx else "No MX records returned",
+            "remediation": "Correct for a non-email domain. Ensure SPF uses -all and DMARC uses p=reject.",
             "status": "info", "score_impact": 0
         })
 
-    # ── SPF ────────────────────────────────────────────────────────────────
+    # ── Non-email domain detection ─────────────────────────────────────────
+    # Flagged when SPF is "-all" (no authorized senders) AND null/no MX.
+    # Used below to adjust DMARC and DKIM findings.
     txt_records = _dns_txt_records(hostname)
     spf_records = [r for r in txt_records if r.startswith("v=spf1")]
+    spf_hard_deny = any("-all" in r for r in spf_records)
+    is_non_email_domain = null_mx and spf_hard_deny
+
+    # ── SPF ────────────────────────────────────────────────────────────────
     if not spf_records:
         findings.append({
             "name": "SPF Record Missing", "category": "Email Security",
@@ -931,19 +1034,24 @@ def check_email_security(hostname: str) -> list:
         # Evaluate policy strength
         if "-all" in spf:
             qualifier, sev, impact = "hard fail (-all)", "pass", 0
+            extra = " Correct for a non-email domain." if is_non_email_domain else ""
         elif "~all" in spf:
             qualifier, sev, impact = "soft fail (~all) — spoofed mail may be accepted", "warn", 3
+            extra = ""
         elif "?all" in spf:
             qualifier, sev, impact = "neutral (?all) — provides no protection", "warn", 6
+            extra = ""
         elif "+all" in spf:
             qualifier, sev, impact = "+all ALLOWS ALL SENDERS — effectively useless", "fail", 12
+            extra = ""
         else:
             qualifier, sev, impact = "no explicit all — weak policy", "warn", 4
+            extra = ""
         status = "pass" if sev == "pass" else ("warn" if sev == "warn" else "fail")
         findings.append({
             "name": f"SPF Policy: {qualifier[:50]}", "category": "Email Security",
             "severity": "MEDIUM" if status in ("warn", "fail") else "INFO",
-            "description": f"SPF record found. Policy: {qualifier}",
+            "description": f"SPF record found. Policy: {qualifier}.{extra}",
             "evidence": spf[:200],
             "remediation": 'Use "-all" (hard fail) instead of "~all" or weaker.',
             "status": status, "score_impact": impact
@@ -964,35 +1072,103 @@ def check_email_security(hostname: str) -> list:
         })
     else:
         dmarc = dmarc_found[0]
-        # Extract policy
-        p_match = re.search(r'\bp=([^;]+)', dmarc, re.IGNORECASE)
-        policy = p_match.group(1).strip().lower() if p_match else "none"
+        # Extract main policy
+        p_match  = re.search(r'\bp=([^;\s]+)', dmarc, re.IGNORECASE)
+        policy   = p_match.group(1).strip().lower() if p_match else "none"
+
+        # Extract optional hardening tags
+        sp_match     = re.search(r'\bsp=([^;\s]+)', dmarc, re.IGNORECASE)
+        adkim_match  = re.search(r'\badkim=([^;\s]+)', dmarc, re.IGNORECASE)
+        aspf_match   = re.search(r'\baspf=([^;\s]+)', dmarc, re.IGNORECASE)
+        rua_match    = re.search(r'\brua=([^;]+)', dmarc, re.IGNORECASE)
+
+        subdomain_policy = sp_match.group(1).strip().lower() if sp_match else "inherits p="
+        adkim            = adkim_match.group(1).strip().lower() if adkim_match else "r"
+        aspf             = aspf_match.group(1).strip().lower() if aspf_match else "r"
+        has_rua          = rua_match is not None
+        strict_alignment = adkim == "s" and aspf == "s"
+        sp_enforced      = subdomain_policy in ("reject", "quarantine")
+
         if policy == "reject":
-            status, impact, desc = "pass", 0, "DMARC policy=reject — full enforcement."
+            status, impact = "pass", 0
+            desc = "DMARC policy=reject — full enforcement."
         elif policy == "quarantine":
-            status, impact, desc = "warn", 4, "DMARC policy=quarantine — spoofed mail goes to spam, not rejected."
-        else:  # none or missing
-            status, impact, desc = "fail", 8, "DMARC policy=none — monitoring only, no enforcement."
-        sp_match = re.search(r'\bsp=([^;]+)', dmarc, re.IGNORECASE)
-        subdomain_policy = sp_match.group(1).strip() if sp_match else "not set (inherits p=)"
+            status, impact = "warn", 4
+            desc = "DMARC policy=quarantine — spoofed mail goes to spam, not rejected."
+        else:
+            # p=none — check for partial hardening to determine severity
+            if is_non_email_domain:
+                # Non-email domain: p=none is unnecessary risk — p=reject is safe immediately
+                status, impact = "warn", 3
+                desc = ("DMARC policy=none on a non-email domain. "
+                        "Since SPF uses -all and no MX exists, there is zero risk in "
+                        "upgrading to p=reject immediately.")
+            elif strict_alignment and has_rua and sp_enforced:
+                # Intentional monitoring rollout: strict alignment + reporting + sp=reject
+                status, impact = "warn", 3
+                desc = ("DMARC policy=none (monitoring mode). "
+                        "Strict alignment (adkim=s; aspf=s) and subdomain enforcement (sp=reject) "
+                        "are configured — upgrade p= to quarantine or reject to complete enforcement.")
+            elif strict_alignment or (has_rua and sp_enforced):
+                status, impact = "warn", 5
+                desc = ("DMARC policy=none (monitoring only). "
+                        "Some hardening tags present but p= must be quarantine or reject to enforce.")
+            else:
+                status, impact = "fail", 8
+                desc = "DMARC policy=none — monitoring only, no enforcement."
+
+        # Warn if rua= is configured but domain has no MX to receive reports
+        rua_warning = ""
+        if has_rua and null_mx:
+            rua_warning = " Note: rua= reports will be undeliverable — the domain has no MX record."
+
+        # Build evidence string with all relevant tags
+        evidence_parts = [f"p={policy}"]
+        if sp_match:
+            evidence_parts.append(f"sp={subdomain_policy}")
+        if adkim_match:
+            evidence_parts.append(f"adkim={adkim}")
+        if aspf_match:
+            evidence_parts.append(f"aspf={aspf}")
+        if has_rua:
+            evidence_parts.append(f"rua={rua_match.group(1).strip()[:60]}")
+        evidence_parts.append(f"strict_alignment={'yes' if strict_alignment else 'no'}")
+        if is_non_email_domain:
+            evidence_parts.append("non-email domain detected")
+
+        if is_non_email_domain and policy == "none":
+            remediation = ("Change p=none to p=reject — safe to do immediately since this domain "
+                           "has no authorized mail senders (SPF -all, null MX). "
+                           "Also update rua= to an address on a domain that accepts email.")
+        elif policy == "none":
+            remediation = ("Upgrade to p=reject (and sp=reject) once monitoring confirms no legitimate "
+                           "mail is being mis-classified. Keep rua= for ongoing aggregate reports.")
+        elif policy == "quarantine":
+            remediation = "Change p=quarantine to p=reject for full enforcement."
+        else:
+            remediation = ""
+
         findings.append({
-            "name": f"DMARC Policy: {policy}", "category": "Email Security",
+            "name": f"DMARC Policy: p={policy}",
+            "category": "Email Security",
             "severity": "MEDIUM" if status in ("warn", "fail") else "INFO",
-            "description": desc + f" Subdomain policy: {subdomain_policy}",
-            "evidence": dmarc[:200],
-            "remediation": 'Set p=reject and sp=reject. Add rua= for aggregate reports.',
-            "status": status, "score_impact": impact
+            "description": desc + rua_warning,
+            "evidence": " | ".join(evidence_parts),
+            "remediation": remediation,
+            "status": status,
+            "score_impact": impact,
         })
 
     # ── DKIM (probe common selectors) ──────────────────────────────────────
     common_selectors = ["default", "google", "selector1", "selector2",
                         "k1", "dkim", "mail", "smtp", "s1", "s2"]
-    dkim_found = []
-    for sel in common_selectors:
-        probe = f"{sel}._domainkey.{hostname}"
-        records = _dns_txt_records(probe)
-        if any("p=" in r and "v=dkim1" in r.lower() for r in records):
-            dkim_found.append(sel)
+
+    def _probe_dkim_sel(sel: str):
+        recs = _dns_txt_records(f"{sel}._domainkey.{hostname}")
+        return sel if any("p=" in r and "v=dkim1" in r.lower() for r in recs) else None
+
+    with ThreadPoolExecutor(max_workers=5) as _dkim_ex:
+        dkim_found = [s for s in _dkim_ex.map(_probe_dkim_sel, common_selectors) if s]
     if dkim_found:
         findings.append({
             "name": "DKIM Key Found", "category": "Email Security",
@@ -1001,14 +1177,22 @@ def check_email_security(hostname: str) -> list:
             "evidence": f"Selectors with valid keys: {', '.join(dkim_found)}",
             "remediation": "", "status": "pass", "score_impact": 0
         })
+    elif is_non_email_domain:
+        findings.append({
+            "name": "DKIM Not Applicable", "category": "Email Security",
+            "severity": "INFO",
+            "description": "No DKIM key found, but domain does not send email (SPF -all, null MX). DKIM is not required.",
+            "evidence": f"Probed selectors: {', '.join(common_selectors)}",
+            "remediation": "", "status": "pass", "score_impact": 0
+        })
     else:
         findings.append({
             "name": "DKIM Key Not Detected", "category": "Email Security",
-            "severity": "MEDIUM",
-            "description": "No DKIM key found for common selectors. Outgoing email may be rejected or marked spam.",
+            "severity": "LOW",
+            "description": "No DKIM key found for common selectors. DKIM may still be configured with a non-standard selector. Verify with your email provider.",
             "evidence": f"Probed selectors: {', '.join(common_selectors)}",
-            "remediation": "Configure DKIM signing and publish the public key as a DNS TXT record.",
-            "status": "warn", "score_impact": 5
+            "remediation": "Confirm DKIM is configured with your email provider and the public key is published as a DNS TXT record.",
+            "status": "warn", "score_impact": 2
         })
 
     return findings
@@ -1044,7 +1228,7 @@ def check_tls_ciphers(hostname: str) -> list:
     negotiated_name = ""
     negotiated_bits = 0
     try:
-        ctx = ssl.create_default_context()
+        ctx = _ssl_context()
         with socket.create_connection((hostname, 443), timeout=8) as sock:
             with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
                 name, _, bits = ssock.cipher()
@@ -1244,17 +1428,17 @@ def check_cors(hostname: str) -> list:
              f"https://{hostname}/"],
             capture_output=True, text=True, timeout=15
         )
-        raw = result.stdout.lower()
+        raw = result.stdout
     except Exception:
         return findings
 
     acao = ""
     acac = ""
     for line in raw.split("\n"):
-        if line.startswith("access-control-allow-origin:"):
-            acao = line.split(":", 1)[1].strip()
-        if line.startswith("access-control-allow-credentials:"):
-            acac = line.split(":", 1)[1].strip()
+        if line.lower().startswith("access-control-allow-origin:"):
+            acao = line.split(":", 1)[1].strip().lower()
+        if line.lower().startswith("access-control-allow-credentials:"):
+            acac = line.split(":", 1)[1].strip().lower()
 
     if not acao:
         findings.append({
@@ -1311,33 +1495,38 @@ def check_cors(hostname: str) -> list:
 def check_dnssec(hostname: str) -> list:
     findings = []
 
-    # Try nslookup -type=DNSKEY first, fall back to dig
-    def _has_dnssec_records(qtype: str, name: str) -> bool:
+    def _dnspython_has(qtype: str, name: str) -> bool:
+        """Use dnspython for reliable cross-platform DNSSEC record lookup."""
         try:
-            r = subprocess.run(
-                ["nslookup", f"-type={qtype}", name],
-                capture_output=True, text=True, timeout=10, errors="replace"
-            )
-            out = r.stdout.lower()
-            return qtype.lower() in out or "answer" in out and len(r.stdout.strip()) > 100
+            import dns.resolver
+            resolver = dns.resolver.Resolver()
+            resolver.use_edns(0, dns.flags.DO, 4096)
+            ans = resolver.resolve(name, qtype)
+            return len(ans) > 0
         except Exception:
             return False
 
-    def _dig_has(qtype: str, name: str) -> bool:
+    def _dig_has(qtype: str, name: str) -> bool:  # noqa: uses _DNS_SERVER from outer scope
+        """Fallback to dig (available on Linux/macOS)."""
         try:
             r = subprocess.run(
-                ["dig", "+short", name, qtype],
+                ["dig", f"@{_DNS_SERVER}", "+short", name, qtype],
                 capture_output=True, text=True, timeout=10, errors="replace"
             )
             return bool(r.stdout.strip())
         except Exception:
             return False
 
-    # Check for DNSKEY record (zone is signed)
-    # We use dig if available for more reliable DNSSEC data
-    dnskey_found = _dig_has("DNSKEY", hostname) or _dig_has("DNSKEY", hostname.split(".", 1)[-1] if "." in hostname else hostname)
-    ds_found     = _dig_has("DS", hostname)
-    rrsig_found  = _dig_has("RRSIG", hostname)
+    # Check for DNSKEY and RRSIG — prefer dnspython (cross-platform),
+    # fall back to dig on Linux/macOS where dnspython may not be installed.
+    zone = hostname.split(".", 1)[-1] if "." in hostname else hostname
+    dnskey_found = (
+        _dnspython_has("DNSKEY", hostname) or
+        _dnspython_has("DNSKEY", zone) or
+        _dig_has("DNSKEY", hostname) or
+        _dig_has("DNSKEY", zone)
+    )
+    rrsig_found = _dnspython_has("RRSIG", hostname) or _dig_has("RRSIG", hostname)
 
     if dnskey_found or rrsig_found:
         findings.append({
@@ -1352,7 +1541,7 @@ def check_dnssec(hostname: str) -> list:
             "name": "DNSSEC Not Configured", "category": "DNSSEC",
             "severity": "MEDIUM",
             "description": "No DNSSEC records detected. DNS responses can be spoofed (DNS cache poisoning).",
-            "evidence": "No DNSKEY or RRSIG records found via dig.",
+            "evidence": "No DNSKEY or RRSIG records found.",
             "remediation": "Enable DNSSEC signing at your DNS registrar/provider and add DS records.",
             "status": "warn", "score_impact": 5
         })
@@ -1407,10 +1596,30 @@ def check_csp_quality(hostname: str) -> list:
     issues = []
     score_hit = 0
 
-    # Check for unsafe keywords
-    csp_lower = csp_value.lower()
+    # Check for unsafe keywords — directive-aware so we don't over-penalise
+    # 'unsafe-inline' in style-src only is a CSS injection risk (severity MEDIUM);
+    # in script-src or default-src it is a full XSS bypass (severity HIGH).
+    # Strip surrounding single-quotes from tokens (e.g. "'unsafe-inline'" → "unsafe-inline")
+    # so set membership checks match the bare keyword names in _CSP_UNSAFE.
+    script_directives = set(directives.get("script-src", []) + directives.get("default-src", []))
+    script_directives = {t.lower().strip("'") for t in script_directives}
+    style_directives  = {t.lower().strip("'") for t in directives.get("style-src", [])}
+
     for kw, (desc, sev, impact) in _CSP_UNSAFE.items():
-        if kw in csp_lower:
+        kw_lower = kw.lower()
+        in_script = kw_lower in script_directives
+        in_style  = kw_lower in style_directives
+
+        if in_script:
+            # Full severity — script injection / XSS
+            issues.append(f"'{kw}' in script-src/default-src: {desc}")
+            score_hit += impact
+        elif in_style and kw == "unsafe-inline":
+            # Style-only — CSS injection risk (lower severity, no score penalty)
+            issues.append(f"'unsafe-inline' in style-src only: CSS injection risk (lower severity — not a script XSS bypass)")
+            # score_hit deliberately NOT incremented for style-only unsafe-inline
+        elif kw_lower in csp_value.lower() and not in_script and not in_style:
+            # Present in some other directive — still flag
             issues.append(f"'{kw}': {desc}")
             score_hit += impact
 
@@ -1440,13 +1649,17 @@ def check_csp_quality(hostname: str) -> list:
         issues.append("upgrade-insecure-requests not set — mixed content (HTTP on HTTPS) possible")
         score_hit += 2
 
-    if issues:
+    # Separate hard issues (score_hit > 0) from advisory notes
+    hard_issues = [i for i in issues if "style-src only" not in i]
+    advisory     = [i for i in issues if "style-src only" in i]
+
+    if hard_issues:
         findings.append({
-            "name": f"CSP Policy Weaknesses ({len(issues)})", "category": "CSP Analysis",
+            "name": f"CSP Policy Weaknesses ({len(hard_issues)})", "category": "CSP Analysis",
             "severity": "HIGH" if score_hit >= 10 else "MEDIUM",
             "description": "Content Security Policy is present but has significant weaknesses.",
-            "evidence": " | ".join(issues),
-            "remediation": "Remove unsafe-inline/unsafe-eval. Use nonces or hashes. Set object-src 'none'.",
+            "evidence": " | ".join(hard_issues),
+            "remediation": "Remove unsafe-inline/unsafe-eval from script-src. Use nonces or hashes. Set object-src 'none'.",
             "status": "fail" if score_hit >= 8 else "warn",
             "score_impact": min(score_hit, 15)
         })
@@ -1457,6 +1670,18 @@ def check_csp_quality(hostname: str) -> list:
             "description": "Content Security Policy has no obvious weaknesses detected.",
             "evidence": csp_value[:200],
             "remediation": "", "status": "pass", "score_impact": 0
+        })
+
+    # Surface advisory-only notes (e.g. unsafe-inline in style-src) as separate info finding
+    if advisory:
+        findings.append({
+            "name": "CSP Advisory Note",
+            "category": "CSP Analysis",
+            "severity": "INFO",
+            "description": "Minor CSP advisory — no score impact.",
+            "evidence": " | ".join(advisory),
+            "remediation": "Consider replacing inline style= attributes with CSS classes to fully eliminate unsafe-inline from style-src.",
+            "status": "info", "score_impact": 0
         })
 
     # Report the actual CSP for reference
@@ -1552,11 +1777,11 @@ def export_html(hostname: str, findings: list, score: int, outfile: str):
         rows += f"""
         <tr>
           <td style="color:{sc_f};text-align:center;font-size:1.2em">{icon}</td>
-          <td><strong>{f.get('name','')}</strong></td>
-          <td style="color:{cat_clr}">{cat}</td>
-          <td style="color:{sc_f}">{f.get('severity','')}</td>
-          <td>{f.get('description','')}</td>
-          <td style="color:#d29922">{f.get('remediation','') or '—'}</td>
+          <td><strong>{html.escape(f.get('name',''))}</strong></td>
+          <td style="color:{cat_clr}">{html.escape(cat)}</td>
+          <td style="color:{sc_f}">{html.escape(f.get('severity',''))}</td>
+          <td>{html.escape(f.get('description',''))}</td>
+          <td style="color:#d29922">{html.escape(f.get('remediation','') or '—')}</td>
         </tr>"""
 
     # Build category failure summary
@@ -1577,6 +1802,71 @@ def export_html(hostname: str, findings: list, score: int, outfile: str):
 
     checks_run = list({f.get("category", "") for f in findings})
     logo_uri = _logo_data_uri()
+
+    # Build score breakdown — only findings that actually deduct points
+    deductions = sorted(
+        [f for f in findings if f.get("score_impact", 0) > 0],
+        key=lambda x: x["score_impact"], reverse=True
+    )
+    total_deducted = sum(f["score_impact"] for f in deductions)
+
+    _icons = {"pass": "✔", "warn": "⚠", "fail": "✘", "info": "ℹ"}
+    if deductions:
+        breakdown_rows = ""
+        for f in deductions:
+            st  = f.get("status", "info")
+            clr = status_color.get(st, "#8b949e")
+            cclr = cat_colours.get(f.get("category", ""), "#8b949e")
+            icon = _icons.get(st, "?")
+            breakdown_rows += (
+                f'<tr>'
+                f'<td style="color:{clr}">{icon}</td>'
+                f'<td>{html.escape(f.get("name", ""))}</td>'
+                f'<td style="color:{cclr}">{html.escape(f.get("category", ""))}</td>'
+                f'<td style="color:{clr}">{html.escape(f.get("severity", ""))}</td>'
+                f'<td style="color:#f85149;text-align:right;font-weight:700;white-space:nowrap">'
+                f'&minus;{f["score_impact"]}</td>'
+                f'</tr>\n'
+            )
+        breakdown_rows += (
+            f'<tr style="border-top:2px solid #30363d">'
+            f'<td colspan="4" style="text-align:right;color:#8b949e;font-size:0.85em">Total deducted</td>'
+            f'<td style="color:#f85149;text-align:right;font-weight:700">&minus;{total_deducted}</td>'
+            f'</tr>\n'
+            f'<tr>'
+            f'<td colspan="4" style="text-align:right;color:#8b949e;font-size:0.85em">'
+            f'Final score (100 &minus; {total_deducted})</td>'
+            f'<td style="color:{sc};text-align:right;font-weight:900;font-size:1.1em">{score}</td>'
+            f'</tr>\n'
+        )
+        score_breakdown_html = (
+            "<h2>Score Breakdown</h2>\n"
+            "<div class=\"table-wrap\">\n"
+            "<table>\n"
+            "  <thead>\n"
+            "    <tr>\n"
+            "      <th style=\"width:36px\"></th>\n"
+            "      <th>Finding</th>\n"
+            "      <th>Category</th>\n"
+            "      <th>Severity</th>\n"
+            "      <th style=\"text-align:right\">Deduction</th>\n"
+            "    </tr>\n"
+            "  </thead>\n"
+            "  <tbody>\n"
+            "    <tr style=\"background:#161b22\">\n"
+            "      <td colspan=\"4\" style=\"color:#8b949e;font-size:0.85em\">Starting score</td>\n"
+            "      <td style=\"color:#2ea043;text-align:right;font-weight:700\">100</td>\n"
+            "    </tr>\n"
+            + breakdown_rows +
+            "  </tbody>\n"
+            "</table>\n"
+            "</div>"
+        )
+    else:
+        score_breakdown_html = (
+            "<h2>Score Breakdown</h2>\n"
+            "<p style=\"color:#2ea043\">No deductions &mdash; perfect score of 100.</p>"
+        )
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1654,6 +1944,8 @@ def export_html(hostname: str, findings: list, score: int, outfile: str):
   {cat_badges}
 </div>
 
+{score_breakdown_html}
+
 <h2>Findings</h2>
 <div class="table-wrap">
 <table>
@@ -1683,26 +1975,26 @@ def export_html(hostname: str, findings: list, score: int, outfile: str):
 
 def check_virustotal(hostname: str) -> list:
     findings = []
-    api_key = os.getenv("VIRUSTOTAL_API_KEY", "")
+    api_key = _read_env_key("VIRUSTOTAL_API_KEY")
     if not api_key:
-        # Fallback: read from a .env file next to this script
-        _env_path = Path(__file__).parent / ".env"
-        if _env_path.exists():
-            for _line in _env_path.read_text(encoding="utf-8").splitlines():
-                _line = _line.strip()
-                if _line.startswith("VIRUSTOTAL_API_KEY=") and not _line.startswith("#"):
-                    api_key = _line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
-    if not api_key:
-        return findings  # silently skip if no key configured
+        return [{
+            "name": "VirusTotal Lookup Skipped",
+            "category": "Threat Intelligence",
+            "severity": "INFO",
+            "description": "VirusTotal API key not configured. Threat intelligence check was not performed.",
+            "evidence": "Get a free API key at https://www.virustotal.com/gui/join-us",
+            "remediation": "Add VIRUSTOTAL_API_KEY=<your-key> to the .env file next to spat_cli.py.",
+            "status": "info",
+            "score_impact": 0,
+        }]
 
-    url = f"https://www.virustotal.com/api/v3/domains/{hostname}"
+    api_url = f"https://www.virustotal.com/api/v3/domains/{hostname}"
     headers = {"x-apikey": api_key}
 
     try:
         import urllib.request
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15, context=_ssl_context()) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         findings.append({
@@ -1714,19 +2006,20 @@ def check_virustotal(hostname: str) -> list:
         })
         return findings
 
-    attrs    = data.get("data", {}).get("attributes", {})
-    stats    = attrs.get("last_analysis_stats", {})
-    malicious   = int(stats.get("malicious", 0))
-    suspicious  = int(stats.get("suspicious", 0))
-    harmless    = int(stats.get("harmless", 0))
-    undetected  = int(stats.get("undetected", 0))
-    total       = malicious + suspicious + harmless + undetected
-    categories  = attrs.get("categories", {})
-    reputation  = attrs.get("reputation", 0)
-    tags        = attrs.get("tags", [])
+    attrs      = data.get("data", {}).get("attributes", {})
+    stats      = attrs.get("last_analysis_stats", {})
+    malicious  = int(stats.get("malicious", 0))
+    suspicious = int(stats.get("suspicious", 0))
+    harmless   = int(stats.get("harmless", 0))
+    undetected = int(stats.get("undetected", 0))
+    total      = malicious + suspicious + harmless + undetected
+    reputation = attrs.get("reputation", 0)
+    categories = attrs.get("categories", {})
+    tags       = attrs.get("tags", [])
 
-    cat_summary = ", ".join(set(categories.values()))[:200] if categories else "N/A"
+    cat_summary = ", ".join(set(categories.values()))[:120] if categories else ""
     tag_summary = ", ".join(tags[:10]) if tags else ""
+    vt_gui_link = f"https://www.virustotal.com/gui/domain/{hostname}"
 
     # ── Malicious detections ──────────────────────────────────────────────
     if malicious >= 5:
@@ -1736,7 +2029,7 @@ def check_virustotal(hostname: str) -> list:
             "severity": "CRITICAL",
             "description": f"{malicious} of {total} security vendors flagged this domain as malicious.",
             "evidence": f"Malicious: {malicious} | Suspicious: {suspicious} | Harmless: {harmless} | Categories: {cat_summary}",
-            "remediation": "Investigate immediately. Domain may be hosting malware, phishing, or C2 infrastructure.",
+            "remediation": f"Investigate immediately. Review: {vt_gui_link}",
             "status": "fail", "score_impact": 25
         })
     elif malicious >= 1:
@@ -1744,9 +2037,9 @@ def check_virustotal(hostname: str) -> list:
             "name": f"VirusTotal: Suspicious ({malicious} vendor flag)",
             "category": "Threat Intelligence",
             "severity": "HIGH",
-            "description": f"{malicious} security vendor(s) flagged this domain. May be a false positive — review recommended.",
-            "evidence": f"Malicious: {malicious} | Suspicious: {suspicious} | Harmless: {harmless} | Categories: {cat_summary}",
-            "remediation": "Review the VirusTotal report at https://www.virustotal.com/gui/domain/" + hostname,
+            "description": f"{malicious} security vendor(s) flagged this domain. May be a false positive — submit a false positive report to the flagging vendor(s).",
+            "evidence": f"Malicious: {malicious} | Suspicious: {suspicious} | Harmless: {harmless} | Domain: {hostname}",
+            "remediation": f"Submit false positive reports and review: {vt_gui_link}",
             "status": "warn", "score_impact": 10
         })
     elif suspicious >= 3:
@@ -1755,8 +2048,8 @@ def check_virustotal(hostname: str) -> list:
             "category": "Threat Intelligence",
             "severity": "MEDIUM",
             "description": f"{suspicious} vendor(s) marked the domain as suspicious.",
-            "evidence": f"Malicious: {malicious} | Suspicious: {suspicious} | Harmless: {harmless} | Categories: {cat_summary}",
-            "remediation": "Review the VirusTotal report.",
+            "evidence": f"Malicious: {malicious} | Suspicious: {suspicious} | Harmless: {harmless} | Domain: {hostname}",
+            "remediation": f"Review the VirusTotal report at {vt_gui_link}",
             "status": "warn", "score_impact": 5
         })
     else:
@@ -1765,7 +2058,7 @@ def check_virustotal(hostname: str) -> list:
             "category": "Threat Intelligence",
             "severity": "INFO",
             "description": f"No malicious detections. {harmless} vendors marked clean, {malicious} malicious, {suspicious} suspicious.",
-            "evidence": f"Reputation score: {reputation} | Categories: {cat_summary}" + (f" | Tags: {tag_summary}" if tag_summary else ""),
+            "evidence": f"Reputation score: {reputation}" + (f" | Categories: {cat_summary}" if cat_summary else "") + (f" | Tags: {tag_summary}" if tag_summary else "") + f" | {vt_gui_link}",
             "remediation": "", "status": "pass", "score_impact": 0
         })
 
@@ -1777,22 +2070,8 @@ def check_virustotal(hostname: str) -> list:
             "severity": "HIGH",
             "description": f"Community reputation score is {reputation} (negative = distrust). Often indicates historical abuse.",
             "evidence": f"VT reputation: {reputation}",
-            "remediation": "Investigate domain history on VirusTotal.",
+            "remediation": f"Investigate domain history on VirusTotal: {vt_gui_link}",
             "status": "warn", "score_impact": 5
-        })
-
-    # ── Phishing / malware category tag ──────────────────────────────────
-    bad_cats = [c.lower() for c in categories.values()
-                if any(w in c.lower() for w in ("phish", "malware", "spam", "scam", "fraud", "exploit"))]
-    if bad_cats:
-        findings.append({
-            "name": f"VirusTotal: Threat Category — {', '.join(bad_cats[:3])}",
-            "category": "Threat Intelligence",
-            "severity": "HIGH",
-            "description": "One or more vendors categorised this domain under a threat category.",
-            "evidence": ", ".join(bad_cats),
-            "remediation": "Review domain classification and remediate if owned.",
-            "status": "fail", "score_impact": 10
         })
 
     return findings
@@ -1807,13 +2086,58 @@ def check_urlhaus(hostname: str) -> list:
     import urllib.request as _ureq
     import urllib.parse as _uparse
 
+    # Resolve Auth-Key (required since 2025) — env var or .env file
+    auth_key = _read_env_key("URLHAUS_AUTH_KEY")
+    if not auth_key:
+        return [{
+            "name": "URLhaus Lookup Skipped",
+            "category": "Threat Intelligence",
+            "severity": "INFO",
+            "description": "URLhaus API key not configured. Set URLHAUS_AUTH_KEY in environment or .env file.",
+            "evidence": "Get a free key at https://auth.abuse.ch/",
+            "remediation": "Add URLHAUS_AUTH_KEY=<your-key> to the .env file next to spat_cli.py.",
+            "status": "info",
+            "score_impact": 0,
+        }]
+
     url = "https://urlhaus-api.abuse.ch/v1/host/"
     data = _uparse.urlencode({"host": hostname}).encode("utf-8")
-    req = _ureq.Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    req = _ureq.Request(url, data=data, headers={
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Auth-Key": auth_key,
+    })
 
     try:
-        with _ureq.urlopen(req, timeout=10) as resp:
+        with _ureq.urlopen(req, timeout=10, context=_ssl_context()) as resp:
             result = json.loads(resp.read().decode("utf-8"))
+    except _ureq.HTTPError as e:
+        # URLhaus returns 403 for invalid/unrecognised keys — read body for details
+        try:
+            body = json.loads(e.read().decode("utf-8"))
+            qs = body.get("query_status", "")
+        except Exception:
+            qs = ""
+        if qs == "unknown_auth_key" or e.code in (401, 403):
+            return [{
+                "name": "URLhaus Lookup Skipped",
+                "category": "Threat Intelligence",
+                "severity": "INFO",
+                "description": "URLhaus API key is invalid or not yet activated.",
+                "evidence": "Activate your key at https://auth.abuse.ch/ and update URLHAUS_AUTH_KEY.",
+                "remediation": "Confirm your abuse.ch account and ensure the key is active.",
+                "status": "info",
+                "score_impact": 0,
+            }]
+        return [{
+            "name": "URLhaus Lookup Failed",
+            "category": "Threat Intelligence",
+            "severity": "INFO",
+            "description": "URLhaus malware check could not be completed.",
+            "evidence": f"HTTP {e.code}: {e.reason}",
+            "remediation": "",
+            "status": "info",
+            "score_impact": 0,
+        }]
     except Exception as e:
         return [{
             "name": "URLhaus Lookup Failed",
@@ -1908,7 +2232,7 @@ def check_urlhaus(hostname: str) -> list:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_scan(hostname: str, ssh_port: int = 22, skip_ssh: bool = False,
-             ssh_only: bool = False) -> list:
+             ssh_only: bool = False, skip_vt: bool = False) -> list:
     all_findings = []
 
     checks = []
@@ -1927,9 +2251,12 @@ def run_scan(hostname: str, ssh_port: int = 22, skip_ssh: bool = False,
             ("DNSSEC",             lambda: check_dnssec(hostname)),
             ("Port Scan",          lambda: check_ports(hostname)),
             ("robots.txt",         lambda: check_robots(hostname)),
-            ("VirusTotal",         lambda: check_virustotal(hostname)),
-            ("URLhaus",            lambda: check_urlhaus(hostname)),
         ]
+        if not skip_vt:
+            checks += [
+                ("VirusTotal",         lambda: check_virustotal(hostname)),
+                ("URLhaus",            lambda: check_urlhaus(hostname)),
+            ]
     if not skip_ssh:
         checks += [
             ("SSH Algorithms",     lambda: check_ssh(hostname, ssh_port)),
@@ -1986,6 +2313,8 @@ Examples:
                         help="Save HTML report to file")
     parser.add_argument("--quiet", "-q",       action="store_true",
                         help="Only show failures and warnings")
+    parser.add_argument("--skip-vt",           action="store_true",
+                        help="Skip VirusTotal and URLhaus threat intelligence lookups (faster)")
     if len(sys.argv) == 1:
         print(BANNER)
         parser.print_help()
@@ -1994,7 +2323,7 @@ Examples:
 
     # Sanitize hostname
     hostname = re.sub(r"https?://", "", args.hostname).rstrip("/").lower().strip()
-    if not re.match(r"^[a-z0-9][a-z0-9.\-]{0,252}[a-z0-9]$", hostname):
+    if not re.match(r"^(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?$", hostname):
         print(f"{RED}Error: Invalid hostname '{hostname}'{RESET}")
         sys.exit(1)
 
@@ -2007,7 +2336,8 @@ Examples:
         hostname,
         ssh_port=args.ssh_port,
         skip_ssh=args.skip_ssh,
-        ssh_only=args.ssh_only
+        ssh_only=args.ssh_only,
+        skip_vt=args.skip_vt
     )
     score = calculate_score(findings)
 

@@ -1,0 +1,31 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "SPAT — Run in external terminal",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/spat_cli.py",
+            "args": ["${input:hostname}"],
+            "console": "externalTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "SPAT — Show help (no args)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/spat_cli.py",
+            "args": [],
+            "console": "externalTerminal",
+            "justMyCode": true
+        }
+    ],
+    "inputs": [
+        {
+            "id": "hostname",
+            "type": "promptString",
+            "description": "Target hostname to scan (e.g. example.com)",
+            "default": "example.com"
+        }
+    ]
+}

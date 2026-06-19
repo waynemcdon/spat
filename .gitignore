@@ -17,12 +17,14 @@ env/
 # Reports / output files
 *.json
 *.html
+# But keep VS Code config
+!.vscode/*.json
 
 # Environment / secrets
 .env
 
 # VS Code
-.vscode/
+# .vscode/ intentionally tracked — preserves launch configs
 *.code-workspace
 
 # OS

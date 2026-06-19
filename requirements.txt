@@ -6,3 +6,9 @@ rich>=13.0.0
 
 # Optional: GUI banner image and icon support
 Pillow>=10.0.0
+
+# DNS queries (DNSSEC detection, cross-platform)
+dnspython>=2.0.0
+
+# SSL CA bundle (fixes certificate errors on Windows / PyInstaller builds)
+certifi>=2024.0.0
