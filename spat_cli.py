@@ -1868,7 +1868,7 @@ def export_html(hostname: str, findings: list, score: int, outfile: str):
             "<p style=\"color:#2ea043\">No deductions &mdash; perfect score of 100.</p>"
         )
 
-    html = f"""<!DOCTYPE html>
+    html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -1965,7 +1965,7 @@ def export_html(hostname: str, findings: list, score: int, outfile: str):
 <p class="meta" style="margin-top:30px">&copy; 2026 Antibody Cyber Technology, LLC &mdash; https://antibodycyber.com</p>
 </body>
 </html>"""
-    Path(outfile).write_text(html, encoding="utf-8")
+    Path(outfile).write_text(html_content, encoding="utf-8")
     print(f"  {GREEN}✔{RESET} HTML report saved: {outfile}")
 
 
